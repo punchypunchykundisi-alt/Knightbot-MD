@@ -11,18 +11,18 @@ process.env.TMP = customTemp;
 
 // Auto-cleaner every 3 hours
 setInterval(() => {
-  fs.readdir(customTemp, (err, files) => {
-    if (err) return;
-    for (const file of files) {
-      const filePath = path.join(customTemp, file);
-      fs.stat(filePath, (err, stats) => {
-        if (!err && Date.now() - stats.mtimeMs > 3 * 60 * 60 * 1000) {
-          fs.unlink(filePath, () => {});
+    fs.readdir(customTemp, (err, files) => {
+        if (err) return;
+        for (const file of files) {
+            const filePath = path.join(customTemp, file);
+            fs.stat(filePath, (err, stats) => {
+                if (!err && Date.now() - stats.mtimeMs > 3 * 60 * 60 * 1000) {
+                    fs.unlink(filePath, () => { });
+                }
+            });
         }
-      });
-    }
-  });
-  console.log('🧹 Temp folder auto-cleaned');
+    });
+    console.log('🧹 Temp folder auto-cleaned');
 }, 3 * 60 * 60 * 1000);
 
 const settings = require('./settings');
@@ -35,6 +35,7 @@ const ytdl = require('ytdl-core');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const { isSudo } = require('./lib/index');
+const isOwnerOrSudo = require('./lib/isOwner');
 const { autotypingCommand, isAutotypingEnabled, handleAutotypingForMessage, handleAutotypingForCommand, showTypingAfterCommand } = require('./commands/autotyping');
 const { autoreadCommand, isAutoreadEnabled, handleAutoread } = require('./commands/autoread');
 
@@ -187,12 +188,36 @@ async function handleMessages(sock, messageUpdate, printLog) {
         const senderId = message.key.participant || message.key.remoteJid;
         const isGroup = chatId.endsWith('@g.us');
         const senderIsSudo = await isSudo(senderId);
+        const senderIsOwnerOrSudo = await isOwnerOrSudo(senderId, sock, chatId);
+
+        // Handle button responses
+        if (message.message?.buttonsResponseMessage) {
+            const buttonId = message.message.buttonsResponseMessage.selectedButtonId;
+            const chatId = message.key.remoteJid;
+
+            if (buttonId === 'channel') {
+                await sock.sendMessage(chatId, {
+                    text: '📢 *Join our Channel:*\nhttps://whatsapp.com/channel/0029Va90zAnIHphOuO8Msp3A'
+                }, { quoted: message });
+                return;
+            } else if (buttonId === 'owner') {
+                const ownerCommand = require('./commands/owner');
+                await ownerCommand(sock, chatId);
+                return;
+            } else if (buttonId === 'support') {
+                await sock.sendMessage(chatId, {
+                    text: `🔗 *Support*\n\nhttps://chat.whatsapp.com/GA4WrOFythU6g3BFVubYM7?mode=wwt`
+                }, { quoted: message });
+                return;
+            }
+        }
 
         const userMessage = (
             message.message?.conversation?.trim() ||
             message.message?.extendedTextMessage?.text?.trim() ||
             message.message?.imageMessage?.caption?.trim() ||
             message.message?.videoMessage?.caption?.trim() ||
+            message.message?.buttonsResponseMessage?.selectedButtonId?.trim() ||
             ''
         ).toLowerCase().replace(/\.\s+/g, '.').trim();
 
@@ -207,17 +232,16 @@ async function handleMessages(sock, messageUpdate, printLog) {
         if (userMessage.startsWith('.')) {
             console.log(`📝 Command used in ${isGroup ? 'group' : 'private'}: ${userMessage}`);
         }
-        // Enforce private mode BEFORE any replies (except owner/sudo)
+        // Read bot mode once; don't early-return so moderation can still run in private mode
+        let isPublic = true;
         try {
             const data = JSON.parse(fs.readFileSync('./data/messageCount.json'));
-            // Allow owner/sudo to use bot even in private mode
-            if (!data.isPublic && !message.key.fromMe && !senderIsSudo) {
-                return; // Silently ignore messages from non-owners when in private mode
-            }
+            if (typeof data.isPublic === 'boolean') isPublic = data.isPublic;
         } catch (error) {
             console.error('Error checking access mode:', error);
-            // Default to public mode if there's an error reading the file
+            // default isPublic=true on error
         }
+        const isOwnerOrSudoCheck = message.key.fromMe || senderIsOwnerOrSudo;
         // Check if user is banned (skip ban check for unban command)
         if (isBanned(senderId) && !userMessage.startsWith('.unban')) {
             // Only respond occasionally to avoid spam
@@ -247,10 +271,13 @@ async function handleMessages(sock, messageUpdate, printLog) {
 
         if (!message.key.fromMe) incrementMessageCount(chatId, senderId);
 
-        // Check for bad words FIRST, before ANY other processing
-        if (isGroup && userMessage) {
-            await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
-
+        // Check for bad words and antilink FIRST, before ANY other processing
+        // Always run moderation in groups, regardless of mode
+        if (isGroup) {
+            if (userMessage) {
+                await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
+            }
+            // Antilink checks message text internally, so run it even if userMessage is empty
             await Antilink(message, sock);
         }
 
@@ -274,11 +301,19 @@ async function handleMessages(sock, messageUpdate, printLog) {
             await handleAutotypingForMessage(sock, chatId, userMessage);
 
             if (isGroup) {
-                // Process non-command messages first
-                await handleChatbotResponse(sock, chatId, message, userMessage, senderId);
+                // Always run moderation features (antitag) regardless of mode
                 await handleTagDetection(sock, chatId, message, senderId);
                 await handleMentionDetection(sock, chatId, message);
+
+                // Only run chatbot in public mode or for owner/sudo
+                if (isPublic || isOwnerOrSudoCheck) {
+                    await handleChatbotResponse(sock, chatId, message, userMessage, senderId);
+                }
             }
+            return;
+        }
+        // In private mode, only owner/sudo can run commands
+        if (!isPublic && !isOwnerOrSudoCheck) {
             return;
         }
 
@@ -295,7 +330,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
 
         // Check admin status only for admin commands in groups
         if (isGroup && isAdminCommand) {
-            const adminStatus = await isAdmin(sock, chatId, senderId, message);
+            const adminStatus = await isAdmin(sock, chatId, senderId);
             isSenderAdmin = adminStatus.isSenderAdmin;
             isBotAdmin = adminStatus.isBotAdmin;
 
@@ -324,7 +359,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
 
         // Check owner status for owner commands
         if (isOwnerCommand) {
-            if (!message.key.fromMe && !senderIsSudo) {
+            if (!message.key.fromMe && !senderIsOwnerOrSudo) {
                 await sock.sendMessage(chatId, { text: '❌ This command is only available for the owner or sudo!' }, { quoted: message });
                 return;
             }
@@ -414,7 +449,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 break;
             case userMessage.startsWith('.mode'):
                 // Check if sender is the owner
-                if (!message.key.fromMe && !senderIsSudo) {
+                if (!message.key.fromMe && !senderIsOwnerOrSudo) {
                     await sock.sendMessage(chatId, { text: 'Only bot owner can use this command!', ...channelInfo }, { quoted: message });
                     return;
                 }
@@ -461,7 +496,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 }
                 break;
             case userMessage.startsWith('.anticall'):
-                if (!message.key.fromMe && !senderIsSudo) {
+                if (!message.key.fromMe && !senderIsOwnerOrSudo) {
                     await sock.sendMessage(chatId, { text: 'Only owner/sudo can use anticall.' }, { quoted: message });
                     break;
                 }
@@ -471,11 +506,6 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 }
                 break;
             case userMessage.startsWith('.pmblocker'):
-                if (!message.key.fromMe && !senderIsSudo) {
-                    await sock.sendMessage(chatId, { text: 'Only owner/sudo can use pmblocker.' }, { quoted: message });
-                    commandExecuted = true;
-                    break;
-                }
                 {
                     const args = userMessage.split(' ').slice(1).join(' ');
                     await pmblockerCommand(sock, chatId, message, args);
@@ -485,7 +515,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
             case userMessage === '.owner':
                 await ownerCommand(sock, chatId);
                 break;
-             case userMessage === '.tagall':
+            case userMessage === '.tagall':
                 await tagAllCommand(sock, chatId, senderId, message);
                 break;
             case userMessage === '.tagnotadmin':
@@ -926,8 +956,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 await handleSsCommand(sock, chatId, message, userMessage.slice(ssCommandLength).trim());
                 break;
             case userMessage.startsWith('.areact') || userMessage.startsWith('.autoreact') || userMessage.startsWith('.autoreaction'):
-                const isOwnerOrSudo = message.key.fromMe || senderIsSudo;
-                await handleAreactCommand(sock, chatId, message, isOwnerOrSudo);
+                await handleAreactCommand(sock, chatId, message, isOwnerOrSudoCheck);
                 break;
             case userMessage.startsWith('.sudo'):
                 await sudoCommand(sock, chatId, message);
@@ -1105,15 +1134,23 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 await piesAlias(sock, chatId, message, 'korea');
                 commandExecuted = true;
                 break;
-            case userMessage === '.hijab':
-                await piesAlias(sock, chatId, message, 'hijab');
+            case userMessage === '.india':
+                await piesAlias(sock, chatId, message, 'india');
+                commandExecuted = true;
+                break;
+            case userMessage === '.malaysia':
+                await piesAlias(sock, chatId, message, 'malaysia');
+                commandExecuted = true;
+                break;
+            case userMessage === '.thailand':
+                await piesAlias(sock, chatId, message, 'thailand');
                 commandExecuted = true;
                 break;
             case userMessage.startsWith('.update'):
                 {
                     const parts = rawText.trim().split(/\s+/);
                     const zipArg = parts[1] && parts[1].startsWith('http') ? parts[1] : '';
-                    await updateCommand(sock, chatId, message, senderIsSudo, zipArg);
+                    await updateCommand(sock, chatId, message, zipArg);
                 }
                 commandExecuted = true;
                 break;
